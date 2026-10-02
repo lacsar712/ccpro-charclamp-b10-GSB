@@ -1,18 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 from litestar import Controller, MediaType, Request, get, post
 from litestar.enums import RequestEncodingType
 from litestar.params import Body
 from litestar.response import Redirect, Template
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
-from charclamp.domain.models import BurnShift, Clamp, User
-from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
-from charclamp.infra.db import SessionLocal
+from charclamp.domain.models import BurnShift, Clamp, User, utcnow
+from charclamp.domain.rules import (
+    RuleError,
+    assert_can_set_clamp_status,
+    can_mark_clamp_drawn,
+    validate_shift_input,
+)
+from charclamp.infra.db import SessionLocal, repeatable_read
 from charclamp.infra.security import verify_password
 
 STATUS_LABELS = {
@@ -48,7 +52,9 @@ def _parse_optional_int(raw: str | None) -> int | None:
 
 
 async def _load_timeline_context(clamp_id: int | None = None) -> dict[str, Any]:
-    async with SessionLocal() as db:
+    # 窑剪影（火色）与时间轴卡片（窑态徽章/峰值）必须来自同一快照，
+    # 与抽屉的「最新峰值 → 出炭提示」共用同一份读取口径，三处不得分叉。
+    async with SessionLocal() as db, repeatable_read(db):
         clamps = list(
             (
                 await db.execute(
@@ -63,7 +69,7 @@ async def _load_timeline_context(clamp_id: int | None = None) -> dict[str, Any]:
         query = (
             select(BurnShift)
             .options(selectinload(BurnShift.clamp).selectinload(Clamp.site))
-            .order_by(BurnShift.started_at.desc())
+            .order_by(BurnShift.started_at.desc(), BurnShift.id.desc())
         )
         if clamp_id is not None:
             query = query.where(BurnShift.clamp_id == clamp_id)
@@ -168,7 +174,7 @@ class TimelineController(Controller):
     async def drawer_clamp(self, request: Request, clamp_id: int) -> Template | Redirect:
         if not request.user:
             return Redirect("/login")
-        async with SessionLocal() as db:
+        async with SessionLocal() as db, repeatable_read(db):
             result = await db.execute(
                 select(Clamp)
                 .where(Clamp.id == clamp_id)
@@ -177,7 +183,7 @@ class TimelineController(Controller):
             clamp = result.scalar_one_or_none()
             if not clamp:
                 return Redirect("/")
-        can_drawn, drawn_msg = can_mark_clamp_drawn(clamp)
+            can_drawn, drawn_msg = can_mark_clamp_drawn(clamp)
         return Template(
             template_name="partials/drawer_clamp.html",
             context={
@@ -202,28 +208,67 @@ class ShiftController(Controller):
     ) -> Redirect:
         if not request.user:
             return Redirect("/login")
-        started_raw = data.get("started_at") or ""
-        started_at = datetime.fromisoformat(started_raw) if started_raw else datetime.utcnow()
-        peak_raw = (data.get("peak_temp_c") or "").strip()
-        peak = float(peak_raw) if peak_raw else None
-        clamp_id = int(data["clamp_id"])
-        async with SessionLocal() as db:
-            shift = BurnShift(
-                clamp_id=clamp_id,
-                started_at=started_at,
-                peak_temp_c=peak,
-                charcoal_grade=(data.get("charcoal_grade") or "B").strip(),
-                notes=(data.get("notes") or "").strip(),
+
+        # —— 第一步：纯字段校验，不打开/触碰数据库。非法班禁止先插卡。 ——
+        try:
+            draft = validate_shift_input(
+                clamp_id_raw=data.get("clamp_id"),
+                started_at_raw=data.get("started_at"),
+                peak_temp_c_raw=data.get("peak_temp_c"),
+                charcoal_grade_raw=data.get("charcoal_grade"),
+                notes_raw=data.get("notes"),
+                now=utcnow(),
             )
-            db.add(shift)
-            clamp = (
-                await db.execute(select(Clamp).where(Clamp.id == clamp_id))
-            ).scalar_one_or_none()
-            if clamp and clamp.status == Clamp.STATUS_STACKED:
-                clamp.status = Clamp.STATUS_BURNING
-            await db.commit()
+        except RuleError as exc:
+            _set_flash(request, str(exc), "error")
+            return Redirect("/")
+
+        # —— 第二步：单事务内完成「窑态翻转 + 插卡」，同成同败。 ——
+        async with SessionLocal() as db:
+            try:
+                async with db.begin():
+                    current = (
+                        await db.execute(
+                            select(Clamp.status).where(Clamp.id == draft.clamp_id)
+                        )
+                    ).one_or_none()
+                    if current is None:
+                        raise RuleError("所选炭窑不存在，班次未登记")
+                    current_status = current[0]
+                    if current_status == Clamp.STATUS_DRAWN:
+                        # 已出炭的窑不得再登记焖烧班次；火色只认窑态字段，
+                        # 写班次这条路永远只会写 burning，绝不会偷偷改成 drawn。
+                        raise RuleError("该窑已出炭，不能再登记焖烧班次")
+
+                    if current_status == Clamp.STATUS_STACKED:
+                        # 第一班并发仲裁：条件 UPDATE 是唯一裁决者，且先于任何插卡。
+                        # 只有当前仍是 stacked 的窑会被翻成 burning（进焖烧火色）。
+                        # 两个并发首班请求中，UPDATE 行锁串行化：抢中的 rowcount=1，
+                        # 落后者语句重读到 burning 后 WHERE 失配 → rowcount=0，
+                        # 此时还没插任何卡，直接整体回滚，只许一笔入库。
+                        flipped = await db.execute(
+                            update(Clamp)
+                            .where(Clamp.id == draft.clamp_id, Clamp.status == Clamp.STATUS_STACKED)
+                            .values(status=Clamp.STATUS_BURNING)
+                        )
+                        if flipped.rowcount == 0:
+                            raise RuleError("该窑的第一班已被他人登记，本班未写入，请刷新后重试")
+
+                    db.add(
+                        BurnShift(
+                            clamp_id=draft.clamp_id,
+                            started_at=draft.started_at,
+                            peak_temp_c=draft.peak_temp_c,
+                            charcoal_grade=draft.charcoal_grade,
+                            notes=draft.notes,
+                        )
+                    )
+            except RuleError as exc:
+                _set_flash(request, str(exc), "error")
+                return Redirect("/")
+
         _set_flash(request, "焖烧班次已登记", "ok")
-        return Redirect(f"/?clamp_id={clamp_id}")
+        return Redirect(f"/?clamp_id={draft.clamp_id}")
 
 
 class ClampController(Controller):
