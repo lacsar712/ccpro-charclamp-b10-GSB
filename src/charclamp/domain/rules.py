@@ -43,3 +43,19 @@ def assert_can_set_clamp_status(clamp: Clamp, new_status: str) -> None:
         ok, msg = can_mark_clamp_drawn(clamp)
         if not ok:
             raise RuleError(msg)
+
+
+def assert_clamp_accepts_shift(clamp: Clamp, expected_status: str | None) -> None:
+    """
+    登记班次的窑态门闩（火色只认窑态字段）：
+    - 已出炭 (drawn) 的窑封窑，禁止再写入班次；写班次也绝不把窑改成 drawn。
+    - 表单打开时看到的窑态快照 expected_status 必须与当前窑态一致，
+      否则说明期间有人抢先登记（第一班夺权），本次必须放弃，不得插卡。
+    """
+    if clamp.status == Clamp.STATUS_DRAWN:
+        raise RuleError(f"窑 {clamp.code} 已出炭封窑，不能再登记班次")
+    if expected_status is not None and expected_status != clamp.status:
+        raise RuleError(
+            f"窑 {clamp.code} 状态已由「{expected_status}」变为"
+            f"「{clamp.status}」，请刷新后按最新窑态重填"
+        )

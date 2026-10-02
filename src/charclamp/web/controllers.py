@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from litestar import Controller, MediaType, Request, get, post
@@ -8,10 +8,12 @@ from litestar.enums import RequestEncodingType
 from litestar.params import Body
 from litestar.response import Redirect, Template
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
-from charclamp.domain.models import BurnShift, Clamp, User
+from charclamp.domain.models import BurnShift, Clamp, User, utcnow
 from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
+from charclamp.domain.services import register_burn_shift
 from charclamp.infra.db import SessionLocal
 from charclamp.infra.security import verify_password
 
@@ -155,11 +157,16 @@ class TimelineController(Controller):
         clamp_id = _parse_optional_int(request.query_params.get("clamp_id"))
         async with SessionLocal() as db:
             clamps = list((await db.execute(select(Clamp).order_by(Clamp.code))).scalars().all())
+        preselect = next((c for c in clamps if c.id == clamp_id), None) or (
+            clamps[0] if clamps else None
+        )
         return Template(
             template_name="partials/drawer_shift.html",
             context={
                 "clamps": clamps,
                 "preselect_clamp_id": clamp_id,
+                "preselect_status": preselect.status if preselect else "",
+                "status_labels": STATUS_LABELS,
                 "user": request.user,
             },
         )
@@ -202,26 +209,72 @@ class ShiftController(Controller):
     ) -> Redirect:
         if not request.user:
             return Redirect("/login")
-        started_raw = data.get("started_at") or ""
-        started_at = datetime.fromisoformat(started_raw) if started_raw else datetime.utcnow()
+
+        # —— 先解析、后入域：任何一项非法都在打开事务/插卡之前拒绝 ——
+        try:
+            clamp_id = int((data.get("clamp_id") or "").strip())
+        except (TypeError, ValueError):
+            _set_flash(request, "未选择有效的炭窑，班次未登记", "error")
+            return Redirect("/")
+
+        expected_raw = (data.get("expected_status") or "").strip()
+        if expected_raw and expected_raw not in (
+            Clamp.STATUS_STACKED,
+            Clamp.STATUS_BURNING,
+            Clamp.STATUS_DRAWN,
+        ):
+            _set_flash(request, "窑态快照无效，请重新打开登记表", "error")
+            return Redirect(f"/?clamp_id={clamp_id}")
+        expected_status = expected_raw or None
+
+        started_raw = (data.get("started_at") or "").strip()
+        if started_raw:
+            try:
+                started_at = datetime.fromisoformat(started_raw)
+            except ValueError:
+                _set_flash(request, "开始时间格式无效，班次未登记", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+        else:
+            started_at = utcnow()
+        if started_at.tzinfo is None:
+            # datetime-local 不带时区；台账统一按 UTC 存。
+            started_at = started_at.replace(tzinfo=timezone.utc)
+
         peak_raw = (data.get("peak_temp_c") or "").strip()
-        peak = float(peak_raw) if peak_raw else None
-        clamp_id = int(data["clamp_id"])
+        if peak_raw:
+            try:
+                peak: float | None = float(peak_raw)
+            except ValueError:
+                _set_flash(request, "峰值温度必须是数字，班次未登记", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+        else:
+            peak = None
+
+        grade = (data.get("charcoal_grade") or "B").strip() or "B"
+        notes = (data.get("notes") or "").strip()
+
         async with SessionLocal() as db:
-            shift = BurnShift(
-                clamp_id=clamp_id,
-                started_at=started_at,
-                peak_temp_c=peak,
-                charcoal_grade=(data.get("charcoal_grade") or "B").strip(),
-                notes=(data.get("notes") or "").strip(),
-            )
-            db.add(shift)
-            clamp = (
-                await db.execute(select(Clamp).where(Clamp.id == clamp_id))
-            ).scalar_one_or_none()
-            if clamp and clamp.status == Clamp.STATUS_STACKED:
-                clamp.status = Clamp.STATUS_BURNING
-            await db.commit()
+            try:
+                # 单一写入路径：门闩、窑态推进、插卡同在一个事务里，
+                # 提交后时间轴卡 / 剪影火色 / 抽屉提示全部从库状态重算，无分叉。
+                await register_burn_shift(
+                    db,
+                    clamp_id=clamp_id,
+                    started_at=started_at,
+                    peak_temp_c=peak,
+                    charcoal_grade=grade,
+                    notes=notes,
+                    expected_status=expected_status,
+                )
+                await db.commit()
+            except RuleError as exc:
+                await db.rollback()
+                _set_flash(request, str(exc), "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+            except SQLAlchemyError:
+                await db.rollback()
+                _set_flash(request, "班次登记失败（数据库异常，已整体回滚）", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
         _set_flash(request, "焖烧班次已登记", "ok")
         return Redirect(f"/?clamp_id={clamp_id}")
 
